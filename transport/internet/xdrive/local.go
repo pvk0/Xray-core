@@ -67,6 +67,10 @@ func (s *localStorage) Put(ctx context.Context, name string, data []byte) error 
 	return nil
 }
 
+func (s *localStorage) probesByName() bool {
+	return true
+}
+
 func (s *localStorage) Get(ctx context.Context, name string) ([]byte, error) {
 	full, err := s.resolve(name)
 	if err != nil {

@@ -230,6 +230,11 @@ type walReader struct {
 	discards  chan string
 	wake      chan struct{}
 	holeSince time.Time
+	probes    bool
+	lastList  time.Time
+	// streaming is set while listings keep bringing several segments at once,
+	// a flow that probing one name at a time would only slow down
+	streaming bool
 
 	errMu sync.Mutex
 	err   error
@@ -244,6 +249,9 @@ func newWALReader(ctx context.Context, storage Storage, prefix string, p params)
 		ch:       make(chan []byte, p.concurrency),
 		discards: make(chan string, 4*p.concurrency),
 		wake:     make(chan struct{}, 1),
+	}
+	if prober, ok := storage.(nameProber); ok {
+		r.probes = prober.probesByName()
 	}
 	go r.run()
 	go r.discardLoop()
@@ -264,7 +272,7 @@ func (r *walReader) run() {
 	active := time.Now()
 	for {
 		polled := time.Now()
-		advanced, eof, err := r.poll()
+		advanced, eof, err := r.poll(time.Since(active) < r.eagerWindow)
 		if err != nil {
 			r.setErr(err)
 			return
@@ -307,13 +315,51 @@ func (r *walReader) run() {
 	}
 }
 
-func (r *walReader) poll() (advanced, eof bool, err error) {
+// nameProber is a storage whose Get by name costs no more than a listing, so a
+// reader that expects the next segment fetches it by name and saves the listing
+// round trip that otherwise comes first
+type nameProber interface {
+	probesByName() bool
+}
+
+// probe fetches the next segment by its name, a miss is no error
+func (r *walReader) probe() bool {
+	name := objectName(r.prefix, r.seq, segSuffix)
+	data, err := r.storage.Get(r.ctx, name)
+	if err != nil {
+		return false
+	}
+	select {
+	case r.ch <- data:
+	case <-r.ctx.Done():
+		return false
+	}
+	r.seq++
+	r.discard(name)
+	return true
+}
+
+func (r *walReader) poll(eager bool) (advanced, eof bool, err error) {
+	if eager && r.probes && !r.streaming {
+		// a hit is delivered at once; a second hit in a row means a burst, and the
+		// listing fetches the rest of it in parallel. Otherwise the reader lists
+		// only now and then, enough to notice an end, a failure or a hole
+		advanced = r.probe()
+		burst := advanced && r.probe()
+		if !burst && time.Since(r.lastList) < r.maxPollInterval {
+			return advanced, false, nil
+		}
+	}
+	r.lastList = time.Now()
+	fetched := 0
+	defer func() { r.streaming = fetched > 1 }()
+
 	listed, err := r.storage.List(r.ctx, r.prefix)
 	if err != nil {
-		return false, false, err
+		return advanced, false, err
 	}
 	if len(listed) == 0 {
-		return false, false, nil
+		return advanced, false, nil
 	}
 
 	pending := make(map[int64]Entry, len(listed))
@@ -374,6 +420,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			}
 			r.seq++
 			advanced = true
+			fetched++
 			r.discard(r.prefix + "/" + batch[i].Name)
 		}
 	}

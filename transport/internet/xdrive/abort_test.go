@@ -3,7 +3,9 @@ package xdrive
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,4 +103,64 @@ func TestPeerStopsReading(t *testing.T) {
 	server.cancel()
 
 	expectBroken(t, client, 10*time.Second)
+}
+
+type countingStorage struct {
+	Storage
+	lists atomic.Int64
+}
+
+func (s *countingStorage) List(ctx context.Context, prefix string) ([]Entry, error) {
+	s.lists.Add(1)
+	return s.Storage.List(ctx, prefix)
+}
+
+func (s *countingStorage) probesByName() bool {
+	return true
+}
+
+func TestProbeSkipsListing(t *testing.T) {
+	local, err := newLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("newLocalStorage: %v", err)
+	}
+	storage := &countingStorage{Storage: local}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := paramsFromConfig(&Config{PollIntervalMs: 5, MaxPollIntervalMs: 200, EagerWindowMs: 10000})
+	reader := newWALReader(ctx, storage, "probe", p)
+
+	const segments = 20
+	for i := 0; i < segments; i++ {
+		time.Sleep(20 * time.Millisecond)
+		want := fmt.Sprintf("segment %d", i)
+		if err := storage.Put(ctx, objectName("probe", int64(i), segSuffix), []byte(want)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		select {
+		case data := <-reader.ch:
+			if string(data) != want {
+				t.Fatalf("read %q, want %q", data, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("segment %d did not arrive", i)
+		}
+	}
+	if lists := storage.lists.Load(); lists >= segments/2 {
+		t.Fatalf("listed %d times for %d segments, want the reader to fetch them by name", lists, segments)
+	}
+
+	if err := storage.Put(ctx, objectName("probe", segments, endSuffix), nil); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	select {
+	case _, ok := <-reader.ch:
+		if ok {
+			t.Fatal("read data past the end")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reader missed the end while probing")
+	}
 }

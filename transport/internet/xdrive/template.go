@@ -367,6 +367,10 @@ func (s *templateStorage) Put(ctx context.Context, name string, data []byte) err
 	return nil
 }
 
+func (s *templateStorage) probesByName() bool {
+	return true
+}
+
 func (s *templateStorage) Get(ctx context.Context, name string) ([]byte, error) {
 	vars := s.baseVars()
 	vars["name"] = s.storedName(name)
