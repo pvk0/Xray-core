@@ -18,6 +18,11 @@ const (
 	segSuffix = ".seg"
 	endSuffix = ".end"
 	errSuffix = ".err"
+
+	// abortSeq names the marker a closing listener leaves in the downlink of
+	// each of its sessions, so that the client stops writing into a session
+	// that no one reads any more
+	abortSeq = 999999999
 )
 
 func objectName(prefix string, seq int64, suffix string) string {
@@ -175,6 +180,21 @@ func (w *walWriter) upload(seq int64, chunk []byte) {
 	}
 }
 
+// written reports whether any segment was handed to the storage
+func (w *walWriter) written() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.seq > 0
+}
+
+func (w *walWriter) fail(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err == nil {
+		w.err = err
+	}
+}
+
 func (w *walWriter) Close() error {
 	w.mu.Lock()
 	if w.closed {
@@ -307,6 +327,10 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		if seq > r.seq {
 			ahead = true
 		}
+	}
+
+	if entry, ok := pending[abortSeq]; ok && strings.HasSuffix(entry.Name, errSuffix) {
+		return advanced, false, errors.New("the peer aborted the session")
 	}
 
 	if _, ok := pending[r.seq]; !ok && ahead {

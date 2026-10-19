@@ -356,3 +356,27 @@ func TestTemplateStallTimeoutRetries(t *testing.T) {
 		t.Fatalf("store holds %d objects, want 1", store.count())
 	}
 }
+
+func TestTemplateDeleteFlattenedSession(t *testing.T) {
+	store := newFakeStore(t)
+	storage := newTemplateBackend(t, store, map[string]interface{}{"type": "none"}, nil)
+	ctx := context.Background()
+
+	for _, name := range []string{
+		"streams/gone/c2s/000000000.seg",
+		"streams/gone/c2s/000000001.seg",
+		"streams/gone/s2c/000000000.end",
+		"streams/kept/c2s/000000000.seg",
+	} {
+		if err := storage.Put(ctx, name, []byte("x")); err != nil {
+			t.Fatalf("Put %s: %v", name, err)
+		}
+	}
+
+	if err := deleteSession(ctx, storage, "gone"); err != nil {
+		t.Fatalf("deleteSession: %v", err)
+	}
+	if store.count() != 1 {
+		t.Fatalf("store holds %d objects after deleting a session, want only the other session's 1", store.count())
+	}
+}

@@ -3,9 +3,11 @@ package xdrive
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 )
 
@@ -29,12 +31,56 @@ type Conn struct {
 
 func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix string, p params, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
-	return &Conn{
+	c := &Conn{
 		cancel:  cancel,
 		writer:  newWALWriter(ctx, storage, writePrefix, p),
 		reader:  newWALReader(ctx, storage, readPrefix, p),
 		onClose: onClose,
 	}
+	go c.watchPeer(ctx, storage, writePrefix, 2*p.holeTimeout)
+	return c
+}
+
+// watchPeer ends the connection when the oldest segment it wrote stays unread
+// for limit: the peer is gone without a word (killed, or its listener was
+// replaced), and writing on would only fill the storage
+func (c *Conn) watchPeer(ctx context.Context, storage Storage, prefix string, limit time.Duration) {
+	stuck, since := int64(-1), time.Time{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(limit / 4):
+		}
+		if !c.writer.written() {
+			continue
+		}
+		listed, err := storage.List(ctx, prefix)
+		if err != nil {
+			continue
+		}
+		oldest := int64(-1)
+		for _, entry := range listed {
+			if seq, ok := parseEntry(entry.Name); ok && strings.HasSuffix(entry.Name, segSuffix) && (oldest < 0 || seq < oldest) {
+				oldest = seq
+			}
+		}
+		switch {
+		case oldest < 0:
+			stuck = -1
+		case oldest != stuck:
+			stuck, since = oldest, time.Now()
+		case time.Since(since) >= limit:
+			c.fail(errors.New("the peer has not read segment ", oldest, " for ", limit))
+			return
+		}
+	}
+}
+
+func (c *Conn) fail(err error) {
+	c.reader.setErr(err)
+	c.writer.fail(err)
+	c.Close()
 }
 
 func (c *Conn) Read(b []byte) (int, error) {

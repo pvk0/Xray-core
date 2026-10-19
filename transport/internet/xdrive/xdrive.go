@@ -23,6 +23,8 @@ const (
 	streamsDir   = "streams"
 	uplinkDir    = "c2s"
 	downlinkDir  = "s2c"
+
+	abortTimeout = 10 * time.Second
 )
 
 func init() {
@@ -198,7 +200,7 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 		if time.Since(at) > l.sessionTTL {
 			errors.LogInfo(logCtx, "dropping the stale announcement of session ", session)
 			go l.drop(full)
-			go l.drop(sessionPrefix(session))
+			go l.dropSession(session)
 			continue
 		}
 		if !l.claim(session) {
@@ -214,6 +216,28 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 
 func (l *Listener) drop(name string) {
 	l.storage.Delete(l.ctx, name)
+}
+
+func (l *Listener) dropSession(session string) {
+	deleteSession(l.ctx, l.storage, session)
+}
+
+// deleteSession removes the objects of both directions one by one before the
+// session itself: a storage that flattens names keeps no folder whose removal
+// would take them along
+func deleteSession(ctx context.Context, storage Storage, session string) error {
+	for _, prefix := range []string{uplinkPrefix(session), downlinkPrefix(session)} {
+		listed, err := storage.List(ctx, prefix)
+		if err != nil {
+			return err
+		}
+		for _, entry := range listed {
+			if err := storage.Delete(ctx, prefix+"/"+entry.Name); err != nil {
+				return err
+			}
+		}
+	}
+	return storage.Delete(ctx, sessionPrefix(session))
 }
 
 func (l *Listener) claim(session string) bool {
@@ -291,7 +315,7 @@ func (l *Listener) collect() error {
 	l.mu.Unlock()
 
 	for _, session := range expired {
-		if err := l.storage.Delete(l.ctx, sessionPrefix(session)); err != nil {
+		if err := deleteSession(l.ctx, l.storage, session); err != nil {
 			return err
 		}
 	}
@@ -303,6 +327,27 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
+	l.mu.Lock()
+	sessions := make([]string, 0, len(l.active))
+	for session := range l.active {
+		sessions = append(sessions, session)
+	}
+	l.mu.Unlock()
+
+	// the sessions die with the listener, and their clients learn it from the
+	// marker instead of writing into them until the peer watch gives up
+	ctx, cancel := context.WithTimeout(context.Background(), abortTimeout)
+	var wg sync.WaitGroup
+	for _, session := range sessions {
+		wg.Add(1)
+		go func(session string) {
+			defer wg.Done()
+			l.storage.Put(ctx, objectName(downlinkPrefix(session), abortSeq, errSuffix), nil)
+		}(session)
+	}
+	wg.Wait()
+	cancel()
+
 	l.cancel()
 	return l.storage.Close()
 }
