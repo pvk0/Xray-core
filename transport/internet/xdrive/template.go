@@ -49,6 +49,9 @@ type storageTemplate struct {
 	Delete      opTemplate    `json:"delete"`
 	List        opTemplate    `json:"list"`
 	Retry       retryTemplate `json:"retry"`
+	// StallTimeoutMs ends and retries a request that makes no progress for
+	// that long, 0 keeps driveTimeout
+	StallTimeoutMs int `json:"stallTimeoutMs"`
 
 	names *regexp.Regexp
 }
@@ -94,9 +97,14 @@ func newTemplateStorage(streamSettings *internet.MemoryStreamConfig, config *Con
 		conc = maxTemplateConcurrency
 	}
 
+	stall := driveTimeout
+	if tmpl.StallTimeoutMs > 0 {
+		stall = time.Duration(tmpl.StallTimeoutMs) * time.Millisecond
+	}
+
 	return &templateStorage{
 		tmpl:     tmpl,
-		client:   newServiceClient(streamSettings, driveTimeout, conc),
+		client:   newServiceClient(streamSettings, stall, conc),
 		folder:   config.RemoteFolder,
 		secrets:  config.Secrets,
 		inflight: make(chan struct{}, conc),

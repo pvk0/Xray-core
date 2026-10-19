@@ -306,3 +306,53 @@ func TestTemplateConcurrencyDefault(t *testing.T) {
 		t.Fatalf("default inflight cap is %d, want %d", cap(storage.inflight), driveMaxInflight)
 	}
 }
+
+func TestTemplateStallTimeoutRetries(t *testing.T) {
+	store := newFakeStore(t)
+	var puts sync.Map
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			if _, seen := puts.LoadOrStore(r.URL.Path, true); !seen {
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+				return
+			}
+		}
+		store.handle(w, r)
+	}))
+	t.Cleanup(hang.Close)
+	t.Cleanup(func() { close(release) })
+	store.server.URL, hang.URL = hang.URL, store.server.URL
+	t.Cleanup(func() { store.server.URL = hang.URL })
+
+	settings := templateSettings(store, map[string]interface{}{"type": "none"}, nil)
+	cfg := settings.ProtocolSettings.(*Config)
+	var tmpl map[string]interface{}
+	if err := json.Unmarshal([]byte(cfg.Template), &tmpl); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tmpl["stallTimeoutMs"] = 300
+	raw, _ := json.Marshal(tmpl)
+	cfg.Template = string(raw)
+
+	storage, err := newTemplateStorage(settings, cfg)
+	if err != nil {
+		t.Fatalf("newTemplateStorage: %v", err)
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := storage.Put(ctx, "streams/s/c2s/000000000.seg", []byte("data")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Put took %v, want a retry soon after the 300ms stall", elapsed)
+	}
+	if store.count() != 1 {
+		t.Fatalf("store holds %d objects, want 1", store.count())
+	}
+}
